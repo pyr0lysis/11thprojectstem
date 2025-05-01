@@ -1,0 +1,239 @@
+#include <Arduino.h>
+#include <Wire.h>
+#include <LiquidCrystal_I2C.h>
+#include <OneWire.h>
+#include <DallasTemperature.h>
+
+// ==================== GLOBAL DECLARATIONS ====================
+#define DO_I2C_ADDR 0x61
+LiquidCrystal_I2C lcd(0x27, 16, 2);  // I2C address may need adjustment
+
+// ==================== TDS SENSOR ====================
+namespace TDS_Sensor {
+  const int TdsSensorPin = A0;
+  #define VREF 5.0
+  #define SCOUNT 30
+
+  int analogBuffer[SCOUNT];
+  int analogBufferIndex = 0;
+  float averageVoltage = 0;
+  float tdsValue = 0;
+  float temperature = 25.0;
+
+  int getMedianNum(int bArray[], int iFilterLen) {
+    int bTab[SCOUNT];  // Fixed-size array
+    for (byte i = 0; i < iFilterLen; i++) bTab[i] = bArray[i];
+    
+    // Bubble sort
+    for (int j = 0; j < iFilterLen - 1; j++) {
+      for (int i = 0; i < iFilterLen - j - 1; i++) {
+        if (bTab[i] > bTab[i + 1]) {
+          int bTemp = bTab[i];
+          bTab[i] = bTab[i + 1];
+          bTab[i + 1] = bTemp;
+        }
+      }
+    }
+    return (iFilterLen & 1) ? bTab[(iFilterLen - 1) / 2] 
+                            : (bTab[iFilterLen/2] + bTab[iFilterLen/2 - 1])/2;
+  }
+
+  void setup() { pinMode(TdsSensorPin, INPUT); }
+
+  void loop() {
+    static unsigned long analogSampleTime = millis();
+    if(millis() - analogSampleTime > 40) {
+      analogSampleTime = millis();
+      analogBuffer[analogBufferIndex] = analogRead(TdsSensorPin);
+      analogBufferIndex = (analogBufferIndex + 1) % SCOUNT;
+    }
+
+    static unsigned long printTime = millis();
+    if(millis() - printTime > 800) {
+      printTime = millis();
+      int analogBufferTemp[SCOUNT];
+      memcpy(analogBufferTemp, analogBuffer, sizeof(analogBuffer));
+      
+      averageVoltage = getMedianNum(analogBufferTemp, SCOUNT) * VREF / 4096.0; // 12-bit ADC fix
+      float compVoltage = averageVoltage / (1.0 + 0.02*(temperature - 25.0));
+      tdsValue = (133.42 * pow(compVoltage, 3) - 255.86 * pow(compVoltage, 2) + 857.39 * compVoltage) * 0.5;
+    }
+  }
+}
+
+// ==================== TEMPERATURE SENSOR ====================
+namespace DallasTemp_Sensor {
+  const int SENSOR_PIN = 13;
+  OneWire oneWire(SENSOR_PIN);
+  DallasTemperature tempSensor(&oneWire);
+  float tempCelsius = 0;
+
+  void setup() { tempSensor.begin(); }
+
+  void loop() {
+    static unsigned long lastTempRequest = 0;
+    if(millis() - lastTempRequest > 1000) {
+      tempSensor.requestTemperatures();
+      tempCelsius = tempSensor.getTempCByIndex(0);
+      TDS_Sensor::temperature = tempCelsius;
+      lastTempRequest = millis();
+    }
+  }
+}
+
+// ==================== pH SENSOR ====================
+namespace PH_Sensor {
+  const int PHSensorPin = A1;
+  float calibration = 21.34;
+  int buffer[10];
+  float pHValue = 7.0;
+
+  void loop() {
+    static unsigned long lastPHUpdate = 0;
+    if(millis() - lastPHUpdate > 2000) {
+      for(int i=0; i<10; i++) buffer[i] = analogRead(PHSensorPin);
+      
+      // Manual sorting
+      for(int i=0; i<9; i++) {
+        for(int j=i+1; j<10; j++) {
+          if(buffer[i] > buffer[j]) {
+            int temp = buffer[i];
+            buffer[i] = buffer[j];
+            buffer[j] = temp;
+          }
+        }
+      }
+      
+      float avg = 0;
+      for(int i=2; i<8; i++) avg += buffer[i];
+      
+      float volt = (avg * 5.0) / 4096.0 / 6.0; // 12-bit ADC fix
+      pHValue = -5.70 * volt + calibration;
+      lastPHUpdate = millis();
+    }
+  }
+}
+
+// ==================== TURBIDITY SENSOR ====================
+namespace Turbidity_Sensor {
+  const int TurbidityPin = A2;
+  int turbidityValue = 0;
+
+  void loop() {
+    static unsigned long lastRead = 0;
+    if(millis() - lastRead > 100) {
+      turbidityValue = analogRead(TurbidityPin);
+      lastRead = millis();
+    }
+  }
+}
+
+// ==================== DISSOLVED OXYGEN SENSOR ====================
+namespace DO_Sensor {
+  char response[32];
+  float doValue = 0.0;
+  unsigned long lastDORead = 0;
+
+  void setup() {
+    Wire.beginTransmission(DO_I2C_ADDR);
+    Wire.write("C,1");
+    Wire.endTransmission();
+    delay(300);
+  }
+
+  void loop() {
+    if(millis() - lastDORead > 2000) {
+      Wire.requestFrom(DO_I2C_ADDR, 20);
+      byte len = 0;
+      while(Wire.available() && len < 31) {
+        char c = Wire.read();
+        if(c == 0) break;
+        response[len++] = c;
+      }
+      response[len] = '\0';
+
+      if(isdigit(response[0])) doValue = atof(response);
+      
+      // Temperature compensation
+      char tempStr[8];
+      dtostrf(DallasTemp_Sensor::tempCelsius, 3, 1, tempStr);
+      Wire.beginTransmission(DO_I2C_ADDR);
+      Wire.write("T,");
+      Wire.write(tempStr);
+      Wire.endTransmission();
+      
+      lastDORead = millis();
+    }
+  }
+}
+
+// ==================== DISPLAY MANAGER ====================
+namespace Display {
+  void update() {
+    static unsigned long lastUpdate = 0;
+    if(millis() - lastUpdate > 500) {
+      lcd.clear();
+      
+      // Line 1: TDS and Temperature
+      lcd.setCursor(0, 0);
+      lcd.print("TDS:");
+      lcd.print(TDS_Sensor::tdsValue, 0);
+      lcd.print(" T:");
+      lcd.print(DallasTemp_Sensor::tempCelsius, 1);
+      
+      // Line 2: pH and DO
+      lcd.setCursor(0, 1);
+      lcd.print("pH:");
+      lcd.print(PH_Sensor::pHValue, 1);
+      lcd.print(" DO:");
+      lcd.print(DO_Sensor::doValue, 1);
+
+      lastUpdate = millis();
+    }
+  }
+}
+
+// ==================== MAIN PROGRAM ====================
+void setup() {
+  Serial.begin(115200);
+  Wire.begin();
+  
+  // Initialize LCD
+  lcd.init();
+  lcd.backlight();
+  lcd.print("System Starting");
+  delay(2000);
+  lcd.clear();
+
+  // Initialize sensors
+  TDS_Sensor::setup();
+  DallasTemp_Sensor::setup();
+  DO_Sensor::setup();
+}
+
+void loop() {
+  TDS_Sensor::loop();
+  DallasTemp_Sensor::loop();
+  PH_Sensor::loop();
+  Turbidity_Sensor::loop();
+  DO_Sensor::loop();
+  Display::update();
+
+  // Serial output
+  static unsigned long lastSerial = 0;
+  if(millis() - lastSerial > 2000) {
+    Serial.print(F("TDS:"));
+    Serial.print(TDS_Sensor::tdsValue);
+    Serial.print(F("ppm Temp:"));
+    Serial.print(DallasTemp_Sensor::tempCelsius);
+    Serial.print(F("C pH:"));
+    Serial.print(PH_Sensor::pHValue, 1);
+    Serial.print(F(" Turb:"));
+    Serial.print(Turbidity_Sensor::turbidityValue);
+    Serial.print(F(" DO:"));
+    Serial.print(DO_Sensor::doValue, 1);
+    Serial.println(F("mg/L"));
+    
+    lastSerial = millis();
+  }
+}
