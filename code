@@ -1,7 +1,8 @@
 #include <Arduino.h>
-#include <LiquidCrystal.h>  // Standard LCD library (parallel)
+#include <LiquidCrystal.h>
 #include <OneWire.h>
 #include <DallasTemperature.h>
+#include <Wire.h>
 #include <math.h>
 
 // ==================== LCD WIRING ====================
@@ -50,7 +51,7 @@ namespace RGB_LED {
     pinMode(GREEN_PIN, OUTPUT);
     pinMode(BLUE_PIN, OUTPUT);
     setColor(0, 0, 0);
-    setColor(0, 255, 0);
+    setColor(0, 255, 0); // Green startup blink
     delay(300);
     setColor(0, 0, 0);
   }
@@ -92,7 +93,7 @@ namespace SensorHealth {
 
 // ==================== TDS SENSOR ====================
 namespace TDS_Sensor {
-  const int TdsSensorPin = A0;
+  const int TdsSensorPin = A0; // Changed back to A0 for stability
   #define VREF 3.3
   #define SCOUNT 30
 
@@ -243,7 +244,7 @@ namespace PH_Sensor {
         }
         float avg = 0;
         for(int i=2; i<8; i++) avg += buffer[i];
-        float volt = (avg * 5.0) / 4096.0 / 6.0;
+        float volt = (avg * 3.3) / 4096.0 / 6.0; // ESP32 uses 3.3V reference
         pHValue = constrain((-5.70 * volt) + calibration, 0.0, 14.0);
       } else {
         pHValue = 7.0;
@@ -283,7 +284,7 @@ namespace DO_Sensor {
   void setup() {
     Wire.begin();
     Wire.beginTransmission(DO_I2C_ADDR);
-    Wire.write("C,1");
+    Wire.write("C,1"); // Continuous mode
     Wire.endTransmission();
     delay(300);
   }
@@ -369,7 +370,7 @@ namespace Display {
 // ==================== MAIN PROGRAM ====================
 void setup() {
   Serial.begin(115200);
-  lcd.begin(16, 2);  // Initialize 16x2 parallel LCD
+  lcd.begin(16, 2);
   lcd.print("System Starting");
   delay(2000);
   lcd.clear();
