@@ -26,7 +26,7 @@ namespace RGB_LED {
   void systemActiveEffect() {
     static unsigned long lastEffect = 0;
     if(millis() - lastEffect > 20) {
-      float brightness = (exp(sin(millis()/1800.0 * PI)) * 128;
+      float brightness = (exp(sin(millis()/1800.0 * PI)) - 0.3678) * 108.0;
       hue = fmod(hue + 0.3, 360);
       setColor(brightness * abs(sin(hue * PI / 180)),
                brightness * abs(sin((hue + 120) * PI / 180)),
@@ -151,7 +151,6 @@ namespace PH_Sensor {
   float calibration = 21.34, pHValue = 7.0;
   int buffer[10];
 
-  // FIX ADDED HERE
   void setup() {
     pinMode(PHSensorPin, INPUT);
   }
@@ -242,9 +241,34 @@ namespace DO_Sensor {
 
 // ==================== DISPLAY MANAGER ====================
 namespace Display {
+  bool checkSensorsConnected() {
+    // Check if any sensor is providing valid data
+    bool tdsConnected = (TDS_Sensor::tdsValue > 0);
+    bool tempConnected = (DallasTemp_Sensor::sensorFound && DallasTemp_Sensor::tempCelsius != DEVICE_DISCONNECTED_C);
+    bool phConnected = (PH_Sensor::pHValue >= 0 && PH_Sensor::pHValue <= 14);
+    bool doConnected = (DO_Sensor::doValue > 0);
+    bool turbConnected = (Turbidity_Sensor::turbidityValue > 0);
+    
+    return tdsConnected || tempConnected || phConnected || doConnected || turbConnected;
+  }
+
+  void showAwaitingMessage() {
+    lcd.clear();
+    lcd.setCursor(0, 0);
+    lcd.print("Awaiting inputs");
+    lcd.setCursor(0, 1);
+    lcd.print("UwU");
+  }
+
   void update() {
     static unsigned long lastUpdate = 0;
     if(millis() - lastUpdate > 500) {
+      if(!checkSensorsConnected()) {
+        showAwaitingMessage();
+        lastUpdate = millis();
+        return;
+      }
+      
       lcd.clear();
       
       // Line 1: TDS and Temperature
@@ -280,7 +304,7 @@ void setup() {
 
   TDS_Sensor::setup();
   DallasTemp_Sensor::setup();
-  PH_Sensor::setup();  // Now works with the added setup()
+  PH_Sensor::setup();
   DO_Sensor::setup();
 }
 
