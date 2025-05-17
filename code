@@ -1,6 +1,3 @@
-// licenciatura en Administración o Dirección de Empresas
-
-
 #include <Arduino.h>
 #include <LiquidCrystal.h>
 #include <OneWire.h>
@@ -9,37 +6,50 @@
 #include <Wire.h>
 #include <ArduinoBLE.h>
 
+// ==================== PIN DEFINITIONS ====================
+// LCD Pins
+#define LCD_RS 17
+#define LCD_EN 16
+#define LCD_D4 4
+#define LCD_D5 5
+#define LCD_D6 18
+#define LCD_D7 19
+
+// RGB LED Pins
+#define LED_RED 27
+#define LED_GREEN 26
+#define LED_BLUE 25
+
+// Sensor Pins
+#define TEMP_SENSOR_PIN 2     // DS18B20
+#define TDS_SENSOR_PIN A3     // High-sensitivity TDS
+#define PH_SENSOR_PIN A4      // pH sensor
+#define TURBIDITY_PIN A2      // Turbidity sensor
+#define DO_I2C_ADDR 0x61      // Dissolved Oxygen I2C address
+
 // ==================== BLE SETUP ====================
-BLEService waterService("19B10000-E8F2-537E-4F6C-D104768A1214"); // Custom service UUID
+BLEService waterService("19B10000-E8F2-537E-4F6C-D104768A1214");
 BLEStringCharacteristic sensorChar("19B10001-E8F2-537E-4F6C-D104768A1214", 
-                                 BLERead | BLENotify, 100); // Characteristic with 100-byte max
+                                 BLERead | BLENotify, 100);
 bool btConnected = false;
 const char* btDeviceName = "WaterQualityMonitor";
 
-// ==================== LCD WIRING ====================
-LiquidCrystal lcd(17, 16, 4, 5, 18, 19); // RS, EN, D4, D5, D6, D7
-
-// ==================== GLOBAL DECLARATIONS ====================
-#define DO_I2C_ADDR 0x61
+// ==================== LCD INIT ====================
+LiquidCrystal lcd(LCD_RS, LCD_EN, LCD_D4, LCD_D5, LCD_D6, LCD_D7);
 
 // ==================== RGB LED ====================
 namespace RGB_LED {
-  const int RED_PIN = 27;
-  const int GREEN_PIN = 26;
-  const int BLUE_PIN = 25;
-  unsigned long lastUpdate = 0;
-  float hue = 0.0;
-
   void setColor(int r, int g, int b) {
-    analogWrite(RED_PIN, 255 - r);
-    analogWrite(GREEN_PIN, 255 - g);
-    analogWrite(BLUE_PIN, 255 - b);
+    analogWrite(LED_RED, 255 - r);
+    analogWrite(LED_GREEN, 255 - g);
+    analogWrite(LED_BLUE, 255 - b);
   }
 
   void systemActiveEffect() {
     static unsigned long lastEffect = 0;
     if(millis() - lastEffect > 20) {
       float brightness = (exp(sin(millis()/1800.0 * PI)) - 0.3678) * 108.0;
+      static float hue = 0.0;
       hue = fmod(hue + 0.3, 360);
       setColor(brightness * abs(sin(hue * PI / 180)),
                brightness * abs(sin((hue + 120) * PI / 180)),
@@ -50,6 +60,7 @@ namespace RGB_LED {
 
   void errorEffect() {
     static bool state = false;
+    static unsigned long lastUpdate = 0;
     if(millis() - lastUpdate > 200) {
       state = !state;
       setColor(state ? 255 : 0, 0, 0);
@@ -58,9 +69,9 @@ namespace RGB_LED {
   }
 
   void init() {
-    pinMode(RED_PIN, OUTPUT);
-    pinMode(GREEN_PIN, OUTPUT);
-    pinMode(BLUE_PIN, OUTPUT);
+    pinMode(LED_RED, OUTPUT);
+    pinMode(LED_GREEN, OUTPUT);
+    pinMode(LED_BLUE, OUTPUT);
     setColor(0, 0, 0);
     setColor(0, 255, 0);
     delay(300);
@@ -83,103 +94,92 @@ namespace SensorHealth {
     }
     
     float avg = sum/samples;
-    bool isStuckValue = (maxVal - minVal < 5);
-    bool isNoisyFloating = (maxVal - minVal > 200) && (avg > 50 && avg < 4000);
-    
-    return isStuckValue || isNoisyFloating;
-  }
-
-  bool isAnalogConnected(int pin, int minValid, int maxValid, int samples=5) {
-    if(isAnalogDisconnected(pin)) return false;
-    
-    int validCount = 0;
-    for(int i=0; i<samples; i++) {
-      int val = analogRead(pin);
-      if(val > minValid && val < maxValid) validCount++;
-      delay(2);
-    }
-    return (validCount >= samples-1);
+    return (maxVal - minVal < 5) || ((maxVal - minVal > 200) && (avg > 50 && avg < 4000));
   }
 }
 
-// ==================== TDS SENSOR ====================
+// ==================== HIGH-SENSITIVITY TDS SENSOR ==================== 
 namespace TDS_Sensor {
-  const int TdsSensorPin = A6;
   #define TDS_VREF 3.3
-  #define TDS_SCOUNT 30
+  #define SAMPLE_INTERVAL 20
+  #define MEDIAN_FILTER_SIZE 15
+  #define TEMP_COMPENSATION 0.02
+  #define CONNECTION_TIMEOUT 5000
 
-  int analogBuffer[TDS_SCOUNT], analogBufferIndex = 0;
-  float averageVoltage = 0, tdsValue = 0, temperature = 25.0;
-  bool isConnected = true;
+  bool isConnected = false;
+  unsigned long lastValidReading = 0;
   
-  float lastValidTDS = 0;
-  unsigned long lastValidReadingTime = 0;
-  const float MAX_TDS_JUMP = 50.0;
+  // Enhanced sensitivity parameters
+  const float coeff3 = 150.0;
+  const float coeff2 = -255.86;
+  const float coeff1 = 857.39;
+  const float alpha = 0.3;
 
-  int getMedianNum(int bArray[], int iFilterLen) {
-    int bTab[TDS_SCOUNT];
-    for(byte i=0; i<iFilterLen; i++) bTab[i] = bArray[i];
-    for(int j=0; j<iFilterLen-1; j++) {
-      for(int i=0; i<iFilterLen-j-1; i++) {
-        if(bTab[i] > bTab[i+1]) {
-          int temp = bTab[i];
-          bTab[i] = bTab[i+1];
-          bTab[i+1] = temp;
-        }
+  int analogBuffer[MEDIAN_FILTER_SIZE];
+  int analogBufferIndex = 0;
+  float tdsValue = 0;
+  float temperature = 25.0;
+  float emaTDS = 0;
+
+  int getMedian(int nums[], int size) {
+    for(int i=1; i<size; i++) {
+      int temp = nums[i];
+      int j = i;
+      while(j>0 && nums[j-1]>temp) {
+        nums[j] = nums[j-1];
+        j--;
       }
+      nums[j] = temp;
     }
-    return (iFilterLen & 1) ? bTab[(iFilterLen-1)/2] 
-                            : (bTab[iFilterLen/2] + bTab[iFilterLen/2-1])/2;
+    return nums[size/2];
   }
 
   void init() { 
-    pinMode(TdsSensorPin, INPUT);
+    pinMode(TDS_SENSOR_PIN, INPUT);
+    for(int i=0; i<MEDIAN_FILTER_SIZE; i++) {
+      analogBuffer[i] = analogRead(TDS_SENSOR_PIN);
+      delay(5);
+    }
   }
 
   void loop() {
-    static unsigned long analogSampleTime = 0, printTime = 0;
+    static unsigned long lastSampleTime = 0;
     
-    if(millis() - analogSampleTime > 40) {
-      analogBuffer[analogBufferIndex] = analogRead(TdsSensorPin);
-      analogBufferIndex = (analogBufferIndex + 1) % TDS_SCOUNT;
-      analogSampleTime = millis();
-    }
-    
-    if(millis() - printTime > 800) {
-      int analogBufferTemp[TDS_SCOUNT];
-      memcpy(analogBufferTemp, analogBuffer, sizeof(analogBuffer));
-      averageVoltage = getMedianNum(analogBufferTemp, TDS_SCOUNT) * TDS_VREF / 4096.0;
+    if(millis() - lastSampleTime > SAMPLE_INTERVAL) {
+      int rawReading = analogRead(TDS_SENSOR_PIN);
       
-      isConnected = SensorHealth::isAnalogConnected(TdsSensorPin, 50, 4000) && 
-                   (averageVoltage < 0.15);
-      
-      if(isConnected) {
-        float compVoltage = averageVoltage / (1.0 + 0.02*(temperature - 25.0));
-        float newTDS = (133.42*pow(compVoltage,3) - 255.86*pow(compVoltage,2) + 857.39*compVoltage)*0.5;
+      if(rawReading > 50 && rawReading < 4000) {
+        isConnected = true;
+        lastValidReading = millis();
         
-        if(lastValidReadingTime > 0 && millis() - lastValidReadingTime < 2000) {
-          float maxAllowed = lastValidTDS + MAX_TDS_JUMP;
-          float minAllowed = lastValidTDS - MAX_TDS_JUMP;
-          if(newTDS > maxAllowed || newTDS < minAllowed) {
-            newTDS = lastValidTDS;
-          }
-        }
+        analogBuffer[analogBufferIndex] = rawReading;
+        analogBufferIndex = (analogBufferIndex + 1) % MEDIAN_FILTER_SIZE;
         
-        tdsValue = newTDS;
-        lastValidTDS = newTDS;
-        lastValidReadingTime = millis();
-      } else {
+        int medianRaw = getMedian(analogBuffer, MEDIAN_FILTER_SIZE);
+        float voltage = medianRaw * (TDS_VREF / 4096.0);
+        float compVoltage = voltage / (1.0 + TEMP_COMPENSATION*(temperature - 25.0));
+        float rawTDS = (coeff3*pow(compVoltage,3) + coeff2*pow(compVoltage,2) + coeff1*compVoltage);
+        
+        emaTDS = (alpha * rawTDS) + ((1-alpha) * emaTDS);
+        tdsValue = constrain(emaTDS, 0, 2000);
+      }
+      else if(millis() - lastValidReading > CONNECTION_TIMEOUT) {
+        isConnected = false;
         tdsValue = 0;
       }
-      printTime = millis();
+      
+      lastSampleTime = millis();
     }
+  }
+
+  void updateTemperature(float newTemp) {
+    temperature = newTemp;
   }
 }
 
 // ==================== TEMPERATURE SENSOR ====================
 namespace DallasTemp_Sensor {
-  const int SENSOR_PIN = 2;
-  OneWire oneWire(SENSOR_PIN);
+  OneWire oneWire(TEMP_SENSOR_PIN);
   DallasTemperature tempSensor(&oneWire);
   DeviceAddress sensorAddress;
   bool sensorFound = false, conversionPending = false;
@@ -191,9 +191,9 @@ namespace DallasTemp_Sensor {
     tempSensor.begin();
     sensorFound = tempSensor.getAddress(sensorAddress, 0);
     if(sensorFound) {
-      tempSensor.setResolution(sensorAddress, 2);
+      tempSensor.setResolution(sensorAddress, 12);
       tempSensor.setWaitForConversion(false);
-      pinMode(SENSOR_PIN, INPUT_PULLUP);
+      pinMode(TEMP_SENSOR_PIN, INPUT_PULLUP);
     }
   }
 
@@ -218,7 +218,7 @@ namespace DallasTemp_Sensor {
       } else {
         isConnected = true;
         tempCelsius = rawTemp;
-        TDS_Sensor::temperature = tempCelsius;
+        TDS_Sensor::updateTemperature(tempCelsius);
         RGB_LED::systemActiveEffect();
       }
       conversionPending = false;
@@ -228,22 +228,22 @@ namespace DallasTemp_Sensor {
 
 // ==================== pH SENSOR ====================
 namespace PH_Sensor {
-  const int PHSensorPin = A4;
   float calibration = 21.34, pHValue = 7.0;
-  int buffer[10];
   bool isConnected = false;
 
   void init() {
-    pinMode(PHSensorPin, INPUT);
+    pinMode(PH_SENSOR_PIN, INPUT);
   }
 
   void loop() {
     static unsigned long lastPHUpdate = 0;
     if(millis() - lastPHUpdate > 2000) {
-      isConnected = SensorHealth::isAnalogConnected(PHSensorPin, 100, 3900);
+      isConnected = !SensorHealth::isAnalogDisconnected(PH_SENSOR_PIN);
       
       if(isConnected) {
-        for(int i=0; i<10; i++) buffer[i] = analogRead(PHSensorPin);
+        int buffer[10];
+        for(int i=0; i<10; i++) buffer[i] = analogRead(PH_SENSOR_PIN);
+        
         for(int i=0; i<9; i++) {
           for(int j=i+1; j<10; j++) {
             if(buffer[i] > buffer[j]) {
@@ -253,9 +253,7 @@ namespace PH_Sensor {
             }
           }
         }
-        float avg = 0;
-        for(int i=2; i<8; i++) avg += buffer[i];
-        float volt = (avg * 5.0) / 4096.0 / 6.0;
+        float volt = (buffer[4] + buffer[5]) * 2.5 / 4096.0;
         pHValue = constrain((-5.70 * volt) + calibration, 0.0, 14.0);
       } else {
         pHValue = 7.0;
@@ -267,19 +265,18 @@ namespace PH_Sensor {
 
 // ==================== TURBIDITY SENSOR ====================
 namespace Turbidity_Sensor {
-  const int TurbidityPin = A2;
   int turbidityValue = 0;
   bool isConnected = false;
 
   void init() {
-    pinMode(TurbidityPin, INPUT);
+    pinMode(TURBIDITY_PIN, INPUT);
   }
 
   void loop() {
     static unsigned long lastRead = 0;
     if(millis() - lastRead > 100) {
-      isConnected = SensorHealth::isAnalogConnected(TurbidityPin, 50, 3000);
-      turbidityValue = isConnected ? analogRead(TurbidityPin) : 0;
+      isConnected = !SensorHealth::isAnalogDisconnected(TURBIDITY_PIN);
+      turbidityValue = isConnected ? analogRead(TURBIDITY_PIN) : 0;
       lastRead = millis();
     }
   }
@@ -358,20 +355,20 @@ namespace Display {
       // Line 1: TDS and Temperature
       lcd.setCursor(0, 0);
       lcd.print("TDS:");
-      if(!TDS_Sensor::isConnected || TDS_Sensor::tdsValue < 10) {
-        lcd.print("0.00");
+      if(!TDS_Sensor::isConnected) {
+        lcd.print("DISCON");
       } else {
         lcd.print(TDS_Sensor::tdsValue, 0);
       }
       lcd.print(" T:");
-      lcd.print(DallasTemp_Sensor::isConnected ? DallasTemp_Sensor::tempCelsius : 0, 1);
+      lcd.print(DallasTemp_Sensor::isConnected ? DallasTemp_Sensor::tempCelsius : 0.0, 1);
       
       // Line 2: pH and DO
       lcd.setCursor(0, 1);
       lcd.print("pH:");
-      lcd.print(PH_Sensor::isConnected ? PH_Sensor::pHValue : 0, 1);
+      lcd.print(PH_Sensor::isConnected ? PH_Sensor::pHValue : 0.0, 1);
       lcd.print(" DO:");
-      lcd.print(DO_Sensor::isConnected ? DO_Sensor::doValue : 0, 1);
+      lcd.print(DO_Sensor::isConnected ? DO_Sensor::doValue : 0.0, 1);
 
       lastUpdate = millis();
     }
@@ -406,10 +403,9 @@ void setup() {
   Serial.begin(115200);
   pinMode(LED_BUILTIN, OUTPUT);
   
-  // Initialize BLE
   if (!BLE.begin()) {
-    Serial.println("Starting BLE failed!");
-    while (1);
+    Serial.println("BLE Init Failed!");
+    while(1);
   }
   
   BLE.setLocalName(btDeviceName);
@@ -421,50 +417,50 @@ void setup() {
   lcd.begin(16, 2);
   lcd.print("System Starting");
   delay(2000);
-  lcd.clear();
 
-  // Initialize all components
   RGB_LED::init();
   TDS_Sensor::init();
   DallasTemp_Sensor::init();
   PH_Sensor::init();
   Turbidity_Sensor::init();
   DO_Sensor::init();
-
-  Serial.println("BLE Ready! Scan with nRF Connect");
 }
 
 void loop() {
-  BLE.poll();  // Must call regularly
+  BLE.poll();
   
-  RGB_LED::systemActiveEffect();
+  // Update all sensors
   TDS_Sensor::loop();
   DallasTemp_Sensor::loop();
   PH_Sensor::loop();
   Turbidity_Sensor::loop();
   DO_Sensor::loop();
+  
+  // Update displays
   Display::update();
+  RGB_LED::systemActiveEffect();
   Bluetooth::checkConnection();
 
+  // BLE Data Transmission
   static unsigned long lastSerial = 0;
   if(millis() - lastSerial > 2000) {
-    String status = "STATUS: ";
-    status += "TDS:" + String(TDS_Sensor::isConnected ? "CON" : "DIS");
+    String status = "STATUS:";
+    status += " TDS:" + String(TDS_Sensor::isConnected ? "CON" : "DIS");
     status += " TEMP:" + String(DallasTemp_Sensor::isConnected ? "CON" : "DIS");
     status += " pH:" + String(PH_Sensor::isConnected ? "CON" : "DIS");
     status += " DO:" + String(DO_Sensor::isConnected ? "CON" : "DIS");
-    status += " TURB:" + String(Turbidity_Sensor::isConnected ? "CON" : "DIS") + "\n";
+    status += " TURB:" + String(Turbidity_Sensor::isConnected ? "CON" : "DIS");
     
-    String values = "VALUES: ";
-    values += "TDS:" + String(TDS_Sensor::tdsValue);
-    values += "ppm Temp:" + String(DallasTemp_Sensor::tempCelsius);
+    String values = "VALUES:";
+    values += " TDS:" + String(TDS_Sensor::tdsValue, 0);
+    values += "ppm Temp:" + String(DallasTemp_Sensor::tempCelsius, 1);
     values += "°C pH:" + String(PH_Sensor::pHValue, 1);
     values += " Turb:" + String(Turbidity_Sensor::turbidityValue);
-    values += " DO:" + String(DO_Sensor::doValue, 1) + "mg/L\n";
+    values += " DO:" + String(DO_Sensor::doValue, 1) + "mg/L";
     
-    Bluetooth::sendToAll(status);
-    Bluetooth::sendToAll(values);
-    
+    Bluetooth::sendToAll(status + "\n" + values + "\n");
     lastSerial = millis();
+// COPYRIGHT PYROLYSIS.WAV
+
   }
 }
