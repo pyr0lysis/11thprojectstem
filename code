@@ -17,11 +17,15 @@
 #define LED_GREEN 26
 #define LED_BLUE 25
 
-#define TEMP_SENSOR_PIN 2     // E-201's DS18B20
+#define TEMP_SENSOR_PIN 2     // DS18B20 from pH sensor
 #define TDS_SENSOR_PIN A3     // TDS
 #define PH_SENSOR_PIN A6      // pH
 #define TURBIDITY_PIN A2      // Turbidity
 #define DO_I2C_ADDR 0x61      // Dissolved Oxygen I2C
+
+// ==================== SENSOR CALIBRATIONS ====================
+#define TURBIDITY_CLEAR_WATER 1500  // Adjust this based on your sensor in clear water
+#define PH_CALIBRATION_OFFSET 0.0   // Adjust during calibration
 
 // ==================== BLE SETUP ====================
 BLEService waterService("19B10000-E8F2-537E-4F6C-D104768A1214");
@@ -56,7 +60,9 @@ namespace TDS_Sensor {
   float temperature = 25.0;
 
   void updateTemperature(float newTemp) {
-    temperature = newTemp;
+    if (newTemp != DEVICE_DISCONNECTED_C) {
+      temperature = newTemp;
+    }
   }
 
   void loop() {
@@ -65,51 +71,95 @@ namespace TDS_Sensor {
       int rawReading = analogRead(TDS_SENSOR_PIN);
       float voltage = rawReading * 3.3 / 4096.0;
       float compVoltage = voltage / (1.0 + 0.02 * (temperature - 25.0));
-      tdsValue = (750.0 * compVoltage); // Simplified TDS calculation
+      tdsValue = (750.0 * compVoltage);
       lastSampleTime = millis();
     }
   }
 }
 
--------------------- PH SENSOR --------------------
-
+// -------------------- PH & TEMPERATURE SENSOR --------------------
 namespace PH_Sensor {
   float pHValue = 7.0;
   float temperature = 25.0;
   OneWire oneWire(TEMP_SENSOR_PIN);
   DallasTemperature tempSensor(&oneWire);
 
-  void loop() {
-    tempSensor.requestTemperatures();
-    temperature = tempSensor.getTempCByIndex(0);
+  void init() {
+    tempSensor.begin();
+    tempSensor.setResolution(12);
+    tempSensor.setWaitForConversion(false);
+  }
 
+  void loop() {
+    static unsigned long lastTempRequest = 0;
+    static bool tempRequested = false;
+    
+    // Non-blocking temperature reading
+    if (!tempRequested) {
+      tempSensor.requestTemperatures();
+      lastTempRequest = millis();
+      tempRequested = true;
+    } 
+    else if (millis() - lastTempRequest > 750) {  // DS18B20 conversion time
+      float rawTemp = tempSensor.getTempCByIndex(0);
+      if (rawTemp != DEVICE_DISCONNECTED_C) {
+        temperature = rawTemp;
+        TDS_Sensor::updateTemperature(temperature);
+      } else {
+        Serial.println("Temp sensor error!");
+      }
+      tempRequested = false;
+    }
+
+    // pH reading
     int buffer[10];
-    for (int i = 0; i < 10; i++) buffer[i] = analogRead(PH_SENSOR_PIN);
-    float volt = (buffer[4] + buffer[5]) * 2.5 / 4096.0;
-    pHValue = (-5.70 * volt) + 21.34; // Pre-calibrated for pH 7.0
+    for (int i = 0; i < 10; i++) {
+      buffer[i] = analogRead(PH_SENSOR_PIN);
+      delay(5);
+    }
+    
+    // Median filter
+    for (int i = 0; i < 9; i++) {
+      for (int j = i+1; j < 10; j++) {
+        if (buffer[i] > buffer[j]) {
+          int temp = buffer[i];
+          buffer[i] = buffer[j];
+          buffer[j] = temp;
+        }
+      }
+    }
+    
+    float volt = (buffer[4] + buffer[5]) / 2 * 3.3 / 4096.0;
+    pHValue = (-5.70 * volt) + 21.34 + PH_CALIBRATION_OFFSET;
   }
 }
 
--------------------- TUBRIDITY SENSOR :3 --------------------
-
+// -------------------- TURBIDITY SENSOR --------------------
 namespace Turbidity_Sensor {
   int turbidityValue = 0;
+  float ntuValue = 0;
 
   void loop() {
-    turbidityValue = analogRead(TURBIDITY_PIN);
+    int raw = analogRead(TURBIDITY_PIN);
+    // Apply calibration
+    turbidityValue = raw;
+    ntuValue = map(raw, 0, 3000, 3000, 0); // Invert and scale (adjust 3000 to your sensor's max)
+    ntuValue = constrain(ntuValue, 0, 3000);
   }
 }
 
--------------------- DISSOLVED OXYGEN SENSOR UWU --------------------
-
+// -------------------- DISSOLVED OXYGEN SENSOR --------------------
 namespace DO_Sensor {
   float doValue = 0.0;
 
   void loop() {
     Wire.requestFrom(DO_I2C_ADDR, 20);
-    char response[20];
-    byte len = Wire.readBytesUntil(0, response, 20);
-    doValue = atof(response);
+    if (Wire.available()) {
+      char response[20];
+      byte len = Wire.readBytesUntil(0, response, 19);
+      response[len] = '\0';
+      doValue = atof(response);
+    }
   }
 }
 
@@ -134,9 +184,16 @@ namespace Display {
 // ==================== MAIN PROGRAM ====================
 void setup() {
   Serial.begin(115200);
+  while (!Serial);
+  Serial.println("System Initializing...");
+  
   pinMode(LED_BUILTIN, OUTPUT);
   
-  BLE.begin();
+  if (!BLE.begin()) {
+    Serial.println("BLE Init Failed!");
+    while(1);
+  }
+  
   BLE.setLocalName(btDeviceName);
   BLE.setAdvertisedService(waterService);
   waterService.addCharacteristic(sensorChar);
@@ -144,8 +201,13 @@ void setup() {
   BLE.advertise();
 
   lcd.begin(16, 2);
+  lcd.print("Initializing...");
+  
   RGB_LED::init();
   Wire.begin();
+  PH_Sensor::init();
+  
+  Serial.println("System Ready");
 }
 
 void loop() {
@@ -157,5 +219,16 @@ void loop() {
   DO_Sensor::loop();
   
   Display::update();
-  delay(1000);
+
+  // Serial output
+  Serial.print("pH: "); Serial.print(PH_Sensor::pHValue, 2);
+  Serial.print(" | TDS: "); Serial.print(TDS_Sensor::tdsValue, 0);
+  Serial.print("ppm | Temp: "); Serial.print(PH_Sensor::temperature, 1);
+  Serial.print("°C | DO: "); Serial.print(DO_Sensor::doValue, 1);
+  Serial.print("mg/L | Turb: "); Serial.print(Turbidity_Sensor::turbidityValue);
+  Serial.print(" (");
+  Serial.print(Turbidity_Sensor::ntuValue);
+  Serial.println(" NTU)");
+  
+  delay(2000);
 }
